@@ -2,8 +2,7 @@
 
 Hệ thống điểm danh sinh viên kết hợp **nhận diện khuôn mặt** và **xác thực vị trí GPS**, dành cho sinh viên, giảng viên và phụ huynh.
 
-Đồ án môn Trí tuệ nhân tạo (AIP202) – Trường ĐH Kiến trúc Đà Nẵng
-Thành viên: Nguyễn Đăng Đạt, Võ Quang Cường · GVHD: TS. Đỗ Phúc Hảo
+
 
 ## Tính năng
 
