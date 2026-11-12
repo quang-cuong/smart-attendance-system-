@@ -1,0 +1,1651 @@
+// =========================================================
+// Cloudflare Worker - API Điểm danh thông minh & Auth/Phân quyền
+// Flutter / Web Admin -> HTTPS -> Worker -> Cloudflare D1
+// =========================================================
+
+export interface Env {
+  attendance_db: D1Database;
+  JWT_SECRET?: string;
+  ADMIN_BOOTSTRAP_SECRET?: string;
+}
+
+// ---------------------------------------------------------
+// Trả về JSON với đầy đủ CORS Headers
+// ---------------------------------------------------------
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=UTF-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Bootstrap-Secret",
+    },
+  });
+}
+
+// ---------------------------------------------------------
+// Xử lý request OPTIONS cho CORS Preflight
+// ---------------------------------------------------------
+function corsResponse(): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Bootstrap-Secret",
+    },
+  });
+}
+
+// =========================================================
+// CRYPTO HELPERS (PBKDF2-SHA256 & HMAC-SHA256 JWT)
+// =========================================================
+
+function bufferToHex(buffer: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function hexToBuffer(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+function base64UrlEncode(str: string): string {
+  const base64 = btoa(str);
+  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64UrlDecode(str: string): string {
+  let base64 = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (base64.length % 4) {
+    base64 += "=";
+  }
+  return atob(base64);
+}
+
+// Băm mật khẩu PBKDF2-SHA256 với 100.000 vòng lặp
+async function hashPassword(
+  password: string,
+  saltHex?: string
+): Promise<{ hashHex: string; saltHex: string }> {
+  const saltBytes = saltHex
+    ? hexToBuffer(saltHex)
+    : crypto.getRandomValues(new Uint8Array(16));
+  const actualSaltHex = saltHex || bufferToHex(
+    Uint8Array.from(saltBytes).buffer
+  );
+
+  const encoder = new TextEncoder();
+  const passwordKey = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: saltBytes,
+      iterations: 100000,
+      hash: "SHA-256",
+    },
+    passwordKey,
+    256
+  );
+
+  return {
+    hashHex: bufferToHex(derivedBits),
+    saltHex: actualSaltHex,
+  };
+}
+
+interface JWTPayload {
+  id: number;
+  username: string;
+  email: string;
+  role: "admin" | "teacher" | "parent" | "student";
+  cv?: number;
+  exp: number;
+}
+
+// Tạo JWT Token có thời hạn (mặc định 8 giờ)
+async function signJWT(payload: JWTPayload, secret: string): Promise<string> {
+  const header = { alg: "HS256", typ: "JWT" };
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const dataToSign = `${encodedHeader}.${encodedPayload}`;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(dataToSign)
+  );
+  const encodedSignature = base64UrlEncode(
+    String.fromCharCode(...new Uint8Array(signature))
+  );
+
+  return `${dataToSign}.${encodedSignature}`;
+}
+
+// Xác minh JWT Token
+async function verifyJWT(
+  token: string,
+  secret: string
+): Promise<JWTPayload | null> {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+
+    const [encodedHeader, encodedPayload, signature] = parts;
+    const dataToSign = `${encodedHeader}.${encodedPayload}`;
+
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"]
+    );
+
+    const sigBytes = Uint8Array.from(base64UrlDecode(signature), (c) =>
+      c.charCodeAt(0)
+    );
+    const isValid = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      sigBytes,
+      encoder.encode(dataToSign)
+    );
+
+    if (!isValid) return null;
+
+    const payload = JSON.parse(base64UrlDecode(encodedPayload)) as JWTPayload;
+    const nowInSeconds = Math.floor(Date.now() / 1000);
+    if (!payload.exp || payload.exp <= nowInSeconds) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// Trích xuất thông tin người dùng từ Bearer Token
+async function getAuthUser(request: Request, env: Env): Promise<JWTPayload | null> {
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return null;
+  }
+  const token = authHeader.substring(7).trim();
+  if (!env.JWT_SECRET) return null;
+  const payload = await verifyJWT(token, env.JWT_SECRET);
+  if (!payload) return null;
+  if (payload.role === "student") {
+    const account = await env.attendance_db.prepare(`
+      SELECT id, status, credential_version FROM student_accounts WHERE id = ?
+    `).bind(payload.id).first<{id:number;status:string;credential_version:number}>();
+    if (!account || account.status !== "active" || payload.cv !== account.credential_version) return null;
+  }
+  return payload;
+}
+
+// =========================================================
+// API ENDPOINTS MỚI - AUTH & ADMIN PHÂN QUYỀN
+// =========================================================
+
+// ---------------------------------------------------------
+// POST /api/admin/bootstrap - Kích hoạt Admin đầu tiên
+// ---------------------------------------------------------
+async function handleAdminBootstrap(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  try {
+    const bootstrapSecret = env.ADMIN_BOOTSTRAP_SECRET;
+    if (!bootstrapSecret) {
+      return jsonResponse({
+        success: false,
+        message: "ADMIN_BOOTSTRAP_SECRET chưa được cấu hình trên server Worker.",
+      }, 500);
+    }
+
+    const headerSecret = request.headers.get("X-Bootstrap-Secret") || "";
+    let bodySecret = "";
+    let body: any = {};
+    try {
+      body = await request.json();
+      bodySecret = body.bootstrap_secret || "";
+    } catch {}
+
+    const providedSecret = headerSecret || bodySecret;
+    if (providedSecret !== bootstrapSecret) {
+      return jsonResponse({
+        success: false,
+        message: "Bootstrap secret không chính xác.",
+      }, 403);
+    }
+
+    // Kiểm tra xem đã có tài khoản Admin nào tồn tại chưa
+    const existingAdmin = await env.attendance_db
+      .prepare("SELECT id FROM accounts WHERE role = 'admin' LIMIT 1")
+      .first();
+
+    if (existingAdmin) {
+      return jsonResponse({
+        success: false,
+        message: "Hệ thống đã có tài khoản Admin. Không thể khởi tạo thêm.",
+      }, 400);
+    }
+
+    const username = body.username?.trim();
+    const email = body.email?.trim()?.toLowerCase();
+    const password = body.password;
+
+    if (!username || !email || !password || password.length < 12) {
+      return jsonResponse({
+        success: false,
+        message: "Username, email và mật khẩu Admin (tối thiểu 12 ký tự) là bắt buộc.",
+      }, 400);
+    }
+
+    const { hashHex, saltHex } = await hashPassword(password);
+
+    const result = await env.attendance_db
+      .prepare(`
+        INSERT INTO accounts (username, email, password_hash, salt, role, status)
+        VALUES (?, ?, ?, ?, 'admin', 'active')
+      `)
+      .bind(username, email, hashHex, saltHex)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Tạo tài khoản Admin đầu tiên thành công!",
+      admin_id: result.meta.last_row_id,
+    }, 201);
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể tạo tài khoản Admin",
+      error: String(error),
+    }, 500);
+  }
+}
+
+// ---------------------------------------------------------
+// POST /api/auth/register - Đăng ký tài khoản (Giáo viên / Phụ huynh)
+// ---------------------------------------------------------
+
+async function handleRegister(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  try {
+    const body = (await request.json()) as {
+      username?: string;
+      email?: string;
+      password?: string;
+      role?: string;
+    };
+
+    const username = body.username?.trim();
+    const email = body.email?.trim().toLowerCase();
+    const password = body.password;
+    const role = body.role?.trim();
+
+    if (!username || !email || !password || !role) {
+      return jsonResponse({
+        success: false,
+        message: "Vui lòng nhập đầy đủ thông tin."
+      }, 400);
+    }
+
+    if (password.length < 10) {
+      return jsonResponse({
+        success: false,
+        message: "Mật khẩu phải có tối thiểu 10 ký tự."
+      }, 400);
+    }
+
+    if (role !== "teacher" && role !== "parent") {
+      return jsonResponse({
+        success: false,
+        message: "Vai trò không hợp lệ."
+      }, 400);
+    }
+
+    const existing = await env.attendance_db
+      .prepare(`
+        SELECT id FROM accounts
+        WHERE LOWER(username) = LOWER(?)
+           OR LOWER(email) = LOWER(?)
+        LIMIT 1
+      `)
+      .bind(username, email)
+      .first();
+
+    if (existing) {
+      return jsonResponse({
+        success: false,
+        message: "Tên đăng nhập hoặc email đã tồn tại."
+      }, 409);
+    }
+
+    const { hashHex, saltHex } = await hashPassword(password);
+
+    // Tạo tài khoản chờ duyệt và yêu cầu đăng ký
+    // trong cùng một giao dịch D1.
+    const results = await env.attendance_db.batch([
+      env.attendance_db.prepare(`
+        INSERT INTO accounts
+          (username, email, password_hash, salt, role, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+      `).bind(username, email, hashHex, saltHex, role),
+
+      env.attendance_db.prepare(`
+        INSERT INTO registration_requests
+          (account_id, requested_role, status)
+        SELECT id, role, 'pending'
+        FROM accounts
+        WHERE username = ? AND email = ?
+      `).bind(username, email)
+    ]);
+
+    if (!results[0].success || !results[1].success) {
+      throw new Error("Không thể lưu thông tin đăng ký.");
+    }
+
+    return jsonResponse({
+      success: true,
+      message: "Đăng ký thành công! Vui lòng chờ Admin duyệt."
+    }, 201);
+
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Lỗi đăng ký tài khoản",
+      error: String(error)
+    }, 500);
+  }
+}
+
+
+// ---------------------------------------------------------
+// POST /api/auth/login - Đăng nhập
+// ---------------------------------------------------------
+async function handleLogin(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  try {
+    const body = (await request.json()) as {
+      username?: string;
+      password?: string;
+    };
+
+    const loginInput = body.username?.trim()?.toLowerCase();
+    const password = body.password;
+
+    if (!loginInput || !password) {
+      return jsonResponse({
+        success: false,
+        message: "Vui lòng nhập tên đăng nhập/email và mật khẩu.",
+      }, 400);
+    }
+
+    // Tìm tài khoản trong bảng accounts
+    // Học sinh có bảng tài khoản riêng để không phải xây lại bảng accounts
+    // (bảng accounts cũ chỉ cho phép admin/teacher/parent bằng CHECK).
+    const studentAccount = await env.attendance_db.prepare(`
+      SELECT sa.id, sa.user_id, sa.username, sa.password_hash, sa.salt,
+             sa.status, sa.must_change_password, sa.credential_version
+      FROM student_accounts sa
+      WHERE LOWER(sa.username) = ? LIMIT 1
+    `).bind(loginInput).first<{
+      id:number; user_id:number; username:string; password_hash:string;
+      salt:string; status:string; must_change_password:number; credential_version:number;
+    }>();
+
+    if (studentAccount) {
+      const { hashHex } = await hashPassword(password, studentAccount.salt);
+      if (studentAccount.status !== "active" || hashHex !== studentAccount.password_hash) {
+        return jsonResponse({success:false,message:"Tên đăng nhập hoặc mật khẩu không chính xác."},401);
+      }
+      if (!env.JWT_SECRET) return jsonResponse({success:false,message:"JWT_SECRET chưa được cấu hình."},500);
+      const payload: JWTPayload = {
+        id: studentAccount.id, username: studentAccount.username,
+        email: "", role: "student", cv: studentAccount.credential_version,
+        exp: Math.floor(Date.now()/1000) + 8*3600,
+      };
+      return jsonResponse({
+        success:true, message:"Đăng nhập thành công", token:await signJWT(payload,env.JWT_SECRET),
+        user:{id:studentAccount.id,username:studentAccount.username,role:"student",
+          student_id:studentAccount.user_id,
+          must_change_password:Boolean(studentAccount.must_change_password)}
+      });
+    }
+
+    const account = await env.attendance_db
+      .prepare(`
+        SELECT id, username, email, password_hash, salt, role, status
+        FROM accounts
+        WHERE (LOWER(username) = ? OR LOWER(email) = ?)
+          AND status = 'active'
+        LIMIT 1
+      `)
+      .bind(loginInput, loginInput)
+      .first<{
+        id: number;
+        username: string;
+        email: string;
+        password_hash: string;
+        salt: string;
+        role: "admin" | "teacher" | "parent";
+        status: string;
+      }>();
+
+    if (!account) {
+      return jsonResponse({
+        success: false,
+        message: "Tên đăng nhập/email hoặc mật khẩu không chính xác.",
+      }, 401);
+    }
+
+    // Xác minh mật khẩu
+    const { hashHex } = await hashPassword(password, account.salt);
+    if (hashHex !== account.password_hash) {
+      return jsonResponse({
+        success: false,
+        message: "Tên đăng nhập/email hoặc mật khẩu không chính xác.",
+      }, 401);
+    }
+
+    // Tạo JWT Token có thời hạn 8 giờ (28.800 giây)
+    const exp = Math.floor(Date.now() / 1000) + 8 * 3600;
+    const payload: JWTPayload = {
+      id: account.id,
+      username: account.username,
+      email: account.email,
+      role: account.role,
+      exp,
+    };
+
+    if (!env.JWT_SECRET) return jsonResponse({success:false,message:"JWT_SECRET chưa được cấu hình."},500);
+    const token = await signJWT(payload, env.JWT_SECRET);
+
+    return jsonResponse({
+      success: true,
+      message: "Đăng nhập thành công",
+      token,
+      user: {
+        id: account.id,
+        username: account.username,
+        email: account.email,
+        role: account.role,
+      },
+    });
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Lỗi đăng nhập",
+      error: String(error),
+    }, 500);
+  }
+}
+
+// ---------------------------------------------------------
+// GET /api/admin/registration-requests - Lấy danh sách đăng ký chờ duyệt
+// ---------------------------------------------------------
+async function handleGetRegistrationRequests(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const user = await getAuthUser(request, env);
+
+  if (!user || user.role !== "admin") {
+    return jsonResponse({
+      success: false,
+      message: "Bạn không có quyền Admin."
+    }, 403);
+  }
+
+  try {
+    const result = await env.attendance_db
+      .prepare(`
+        SELECT
+          r.id AS request_id,
+          r.account_id,
+          a.username,
+          a.email,
+          r.requested_role,
+          r.status,
+          r.created_at
+        FROM registration_requests r
+        INNER JOIN accounts a ON a.id = r.account_id
+        WHERE r.status = 'pending'
+        ORDER BY r.id DESC
+      `)
+      .all();
+
+    return jsonResponse({
+      success: true,
+      data: result.results
+    });
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể lấy danh sách yêu cầu đăng ký",
+      error: String(error)
+    }, 500);
+  }
+}
+
+// ---------------------------------------------------------
+// POST /api/admin/registration-requests/:id/approve - Duyệt tài khoản
+// ---------------------------------------------------------
+async function handleApproveRequest(
+  request: Request,
+  env: Env,
+  requestId: number
+): Promise<Response> {
+  const user = await getAuthUser(request, env);
+
+  if (!user || user.role !== "admin") {
+    return jsonResponse({
+      success: false,
+      message: "Bạn không có quyền Admin."
+    }, 403);
+  }
+
+  try {
+    const regReq = await env.attendance_db
+      .prepare(`
+        SELECT
+          r.id,
+          r.account_id,
+          r.requested_role,
+          a.username
+        FROM registration_requests r
+        INNER JOIN accounts a ON a.id = r.account_id
+        WHERE r.id = ?
+          AND r.status = 'pending'
+          AND a.status = 'pending'
+      `)
+      .bind(requestId)
+      .first<{
+        id: number;
+        account_id: number;
+        requested_role: string;
+        username: string;
+      }>();
+
+    if (!regReq) {
+      return jsonResponse({
+        success: false,
+        message: "Không tìm thấy yêu cầu đăng ký đang chờ duyệt."
+      }, 404);
+    }
+
+    const nowISO = new Date().toISOString();
+
+    await env.attendance_db.batch([
+      env.attendance_db.prepare(`
+        UPDATE accounts
+        SET status = 'active'
+        WHERE id = ? AND status = 'pending'
+      `).bind(regReq.account_id),
+
+      env.attendance_db.prepare(`
+        UPDATE registration_requests
+        SET status = 'approved',
+            reviewed_at = ?
+        WHERE id = ? AND status = 'pending'
+      `).bind(nowISO, requestId)
+    ]);
+
+    return jsonResponse({
+      success: true,
+      message: `Đã duyệt tài khoản ${regReq.username} thành công.`
+    });
+
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể duyệt yêu cầu đăng ký",
+      error: String(error)
+    }, 500);
+  }
+}
+
+
+// ---------------------------------------------------------
+// POST /api/admin/registration-requests/:id/reject - Từ chối đăng ký
+// ---------------------------------------------------------
+
+async function handleRejectRequest(
+  request: Request,
+  env: Env,
+  requestId: number
+): Promise<Response> {
+  const user = await getAuthUser(request, env);
+
+  if (!user || user.role !== "admin") {
+    return jsonResponse({
+      success: false,
+      message: "Bạn không có quyền Admin."
+    }, 403);
+  }
+
+  try {
+    const regReq = await env.attendance_db
+      .prepare(`
+        SELECT account_id
+        FROM registration_requests
+        WHERE id = ? AND status = 'pending'
+      `)
+      .bind(requestId)
+      .first<{ account_id: number }>();
+
+    if (!regReq) {
+      return jsonResponse({
+        success: false,
+        message: "Không tìm thấy yêu cầu chờ duyệt."
+      }, 404);
+    }
+
+    const nowISO = new Date().toISOString();
+
+    await env.attendance_db.batch([
+      env.attendance_db.prepare(`
+        UPDATE accounts
+        SET status = 'rejected'
+        WHERE id = ? AND status = 'pending'
+      `).bind(regReq.account_id),
+
+      env.attendance_db.prepare(`
+        UPDATE registration_requests
+        SET status = 'rejected', reviewed_at = ?
+        WHERE id = ? AND status = 'pending'
+      `).bind(nowISO, requestId)
+    ]);
+
+    return jsonResponse({
+      success: true,
+      message: "Đã từ chối yêu cầu đăng ký."
+    });
+
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể từ chối yêu cầu đăng ký",
+      error: String(error)
+    }, 500);
+  }
+}
+
+
+// ---------------------------------------------------------
+// GET /api/admin/accounts - Danh sách tài khoản hệ thống
+// ---------------------------------------------------------
+async function handleGetAccounts(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const user = await getAuthUser(request, env);
+  if (!user || user.role !== "admin") {
+    return jsonResponse({
+      success: false,
+      message: "Quyền truy cập bị từ chối. Cần quyền Admin.",
+    }, 403);
+  }
+
+  try {
+    const result = await env.attendance_db
+      .prepare(`
+        SELECT id, username, email, role, status, created_at
+        FROM accounts
+        ORDER BY id DESC
+      `)
+      .all();
+
+    return jsonResponse({
+      success: true,
+      data: result.results,
+    });
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể lấy danh sách tài khoản",
+      error: String(error),
+    }, 500);
+  }
+}
+
+// ---------------------------------------------------------
+// POST /api/admin/teacher-classes - Phân công Giáo viên vào Lớp
+// ---------------------------------------------------------
+async function handleAssignTeacherClass(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const user = await getAuthUser(request, env);
+  if (!user || user.role !== "admin") {
+    return jsonResponse({
+      success: false,
+      message: "Quyền truy cập bị từ chối. Cần quyền Admin.",
+    }, 403);
+  }
+
+  try {
+    const body = (await request.json()) as {
+      account_id?: number;
+      class_id?: number;
+    };
+
+    const accountId = Number(body.account_id);
+    const classId = Number(body.class_id);
+
+    if (!accountId || !classId) {
+      return jsonResponse({
+        success: false,
+        message: "account_id và class_id là bắt buộc.",
+      }, 400);
+    }
+
+    const teacher = await env.attendance_db
+      .prepare("SELECT id FROM accounts WHERE id = ? AND role = 'teacher' LIMIT 1")
+      .bind(accountId)
+      .first();
+
+    if (!teacher) {
+      return jsonResponse({
+        success: false,
+        message: "Tài khoản giáo viên không tồn tại.",
+      }, 404);
+    }
+
+    const classObj = await env.attendance_db
+      .prepare("SELECT id FROM classes WHERE id = ? LIMIT 1")
+      .bind(classId)
+      .first();
+
+    if (!classObj) {
+      return jsonResponse({
+        success: false,
+        message: "Lớp học không tồn tại.",
+      }, 404);
+    }
+
+    await env.attendance_db
+      .prepare(`
+        INSERT OR IGNORE INTO teacher_classes (account_id, class_id)
+        VALUES (?, ?)
+      `)
+      .bind(accountId, classId)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Phân công giáo viên vào lớp thành công.",
+    }, 201);
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Lỗi phân công giáo viên",
+      error: String(error),
+    }, 500);
+  }
+}
+
+// ---------------------------------------------------------
+// POST /api/admin/parent-students - Liên kết Phụ huynh với Học sinh
+// ---------------------------------------------------------
+async function handleAssignParentStudent(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const user = await getAuthUser(request, env);
+  if (!user || user.role !== "admin") {
+    return jsonResponse({
+      success: false,
+      message: "Quyền truy cập bị từ chối. Cần quyền Admin.",
+    }, 403);
+  }
+
+  try {
+    const body = (await request.json()) as {
+      account_id?: number;
+      student_id?: number;
+    };
+
+    const accountId = Number(body.account_id);
+    const studentId = Number(body.student_id);
+
+    if (!accountId || !studentId) {
+      return jsonResponse({
+        success: false,
+        message: "account_id và student_id là bắt buộc.",
+      }, 400);
+    }
+
+    const parent = await env.attendance_db
+      .prepare("SELECT id FROM accounts WHERE id = ? AND role = 'parent' LIMIT 1")
+      .bind(accountId)
+      .first();
+
+    if (!parent) {
+      return jsonResponse({
+        success: false,
+        message: "Tài khoản phụ huynh không tồn tại.",
+      }, 404);
+    }
+
+    const student = await env.attendance_db
+      .prepare("SELECT id FROM users WHERE id = ? LIMIT 1")
+      .bind(studentId)
+      .first();
+
+    if (!student) {
+      return jsonResponse({
+        success: false,
+        message: "Sinh viên/Học sinh không tồn tại.",
+      }, 404);
+    }
+
+    await env.attendance_db
+      .prepare(`
+        INSERT OR IGNORE INTO parent_students (account_id, student_id)
+        VALUES (?, ?)
+      `)
+      .bind(accountId, studentId)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Liên kết phụ huynh với học sinh thành công.",
+    }, 201);
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Lỗi liên kết phụ huynh",
+      error: String(error),
+    }, 500);
+  }
+}
+
+// ---------------------------------------------------------
+// GET /api/role/attendance - Lọc lịch sử điểm danh theo Vai trò
+// ---------------------------------------------------------
+async function handleRoleAttendance(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const user = await getAuthUser(request, env);
+  if (!user) {
+    return jsonResponse({
+      success: false,
+      message: "Chưa đăng nhập hoặc Token không hợp lệ.",
+    }, 401);
+  }
+
+  try {
+    let query = "";
+    let params: any[] = [];
+
+    if (user.role === "admin") {
+      // Admin: Xem tất cả
+      query = `
+        SELECT
+          a.id, a.attendance_time, a.latitude, a.longitude,
+          a.distance, a.face_similarity, a.status,
+          u.student_code, u.full_name,
+          c.class_code, c.class_name
+        FROM attendance a
+        INNER JOIN users u ON u.id = a.user_id
+        INNER JOIN classes c ON c.id = a.class_id
+        ORDER BY a.attendance_time DESC
+      `;
+    } else if (user.role === "teacher") {
+      // Giáo viên: Chỉ xem các lớp được gán trong teacher_classes
+      query = `
+        SELECT
+          a.id, a.attendance_time, a.latitude, a.longitude,
+          a.distance, a.face_similarity, a.status,
+          u.student_code, u.full_name,
+          c.class_code, c.class_name
+        FROM attendance a
+        INNER JOIN users u ON u.id = a.user_id
+        INNER JOIN classes c ON c.id = a.class_id
+        INNER JOIN teacher_classes tc ON tc.class_id = a.class_id
+        WHERE tc.account_id = ?
+        ORDER BY a.attendance_time DESC
+      `;
+      params = [user.id];
+    } else if (user.role === "parent") {
+      // Phụ huynh: Chỉ xem học sinh/sinh viên được gán trong parent_students
+      query = `
+        SELECT
+          a.id, a.attendance_time, a.latitude, a.longitude,
+          a.distance, a.face_similarity, a.status,
+          u.student_code, u.full_name,
+          c.class_code, c.class_name
+        FROM attendance a
+        INNER JOIN users u ON u.id = a.user_id
+        INNER JOIN classes c ON c.id = a.class_id
+        INNER JOIN parent_students ps ON ps.student_id = a.user_id
+        WHERE ps.account_id = ?
+        ORDER BY a.attendance_time DESC
+      `;
+      params = [user.id];
+    } else if (user.role === "student") {
+      const student = await env.attendance_db.prepare(`
+        SELECT user_id,must_change_password FROM student_accounts WHERE id=?
+      `).bind(user.id).first<{user_id:number;must_change_password:number}>();
+      if (!student || student.must_change_password) return jsonResponse({success:false,message:"Bạn phải đổi mật khẩu trước."},403);
+      query = `
+        SELECT a.id,a.attendance_time,a.latitude,a.longitude,a.distance,
+          a.face_similarity,a.status,u.student_code,u.full_name,c.class_code,c.class_name
+        FROM attendance a JOIN users u ON u.id=a.user_id
+        JOIN classes c ON c.id=a.class_id
+        WHERE a.user_id=? ORDER BY a.attendance_time DESC
+      `;
+      params=[student.user_id];
+    } else {
+      return jsonResponse({
+        success: false,
+        message: "Vai trò không hợp lệ.",
+      }, 403);
+    }
+
+    const stmt = env.attendance_db.prepare(query);
+    const result = params.length > 0 ? await stmt.bind(...params).all() : await stmt.all();
+
+    return jsonResponse({
+      success: true,
+      role: user.role,
+      data: result.results,
+    });
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể lấy lịch sử điểm danh theo vai trò",
+      error: String(error),
+    }, 500);
+  }
+}
+
+
+// =========================================================
+// STUDENT AUTH - Giai đoạn 1 (không ảnh hưởng các bảng cũ)
+// =========================================================
+
+function temporaryPassword(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%";
+  const bytes = crypto.getRandomValues(new Uint8Array(18));
+  return Array.from(bytes, b => alphabet[b % alphabet.length]).join("");
+}
+
+async function handleAdminListStudentAccounts(request:Request,env:Env):Promise<Response> {
+  const actor=await getAuthUser(request,env);
+  if(!actor||actor.role!=="admin") return jsonResponse({success:false,message:"Cần quyền Admin."},403);
+  const result=await env.attendance_db.prepare(`
+    SELECT sa.id AS account_id,sa.username,sa.status,sa.must_change_password,
+           sa.created_at,u.id AS student_id,u.student_code,u.full_name
+    FROM student_accounts sa JOIN users u ON u.id=sa.user_id ORDER BY sa.id DESC
+  `).all();
+  return jsonResponse({success:true,data:result.results});
+}
+
+async function handleAdminCreateStudentAccount(request:Request,env:Env):Promise<Response> {
+  const actor = await getAuthUser(request, env);
+  if (!actor || actor.role !== "admin") return jsonResponse({success:false,message:"Cần quyền Admin."},403);
+  try {
+    const body = await request.json() as {student_id?:number};
+    const studentId = Number(body.student_id);
+    if (!Number.isSafeInteger(studentId) || studentId<=0) return jsonResponse({success:false,message:"student_id không hợp lệ."},400);
+    const student = await env.attendance_db.prepare("SELECT id, student_code FROM users WHERE id = ?")
+      .bind(studentId).first<{id:number;student_code:string}>();
+    if (!student) return jsonResponse({success:false,message:"Không tìm thấy học sinh."},404);
+    const taken = await env.attendance_db.prepare(`
+      SELECT 1 AS found FROM accounts WHERE LOWER(username)=LOWER(?) OR LOWER(email)=LOWER(?) LIMIT 1
+    `).bind(student.student_code,student.student_code).first();
+    if (taken) return jsonResponse({success:false,message:"Mã sinh viên đang trùng tài khoản khác."},409);
+    const password = temporaryPassword();
+    const {hashHex,saltHex} = await hashPassword(password);
+    const result = await env.attendance_db.prepare(`
+      INSERT INTO student_accounts
+        (user_id,username,password_hash,salt,status,must_change_password,credential_version)
+      VALUES (?,?,?,?,'active',1,1)
+    `).bind(studentId,student.student_code,hashHex,saltHex).run();
+    return jsonResponse({success:true,message:"Đã tạo tài khoản học sinh.",id:result.meta.last_row_id,
+      username:student.student_code,temporary_password:password,
+      warning:"Chỉ hiển thị mật khẩu tạm thời một lần. Yêu cầu học sinh đổi mật khẩu khi đăng nhập."},201);
+  } catch (error) {
+    const message=String(error);
+    if (message.includes("UNIQUE constraint failed")) return jsonResponse({success:false,message:"Học sinh này đã có tài khoản."},409);
+    return jsonResponse({success:false,message:"Không thể tạo tài khoản học sinh",error:message},500);
+  }
+}
+
+async function handleAdminResetStudentPassword(request:Request,env:Env,studentAccountId:number):Promise<Response> {
+  const actor=await getAuthUser(request,env);
+  if(!actor||actor.role!=="admin") return jsonResponse({success:false,message:"Cần quyền Admin."},403);
+  try {
+    const existing=await env.attendance_db.prepare("SELECT id,username FROM student_accounts WHERE id=?")
+      .bind(studentAccountId).first<{id:number;username:string}>();
+    if(!existing) return jsonResponse({success:false,message:"Không tìm thấy tài khoản học sinh."},404);
+    const password=temporaryPassword();
+    const {hashHex,saltHex}=await hashPassword(password);
+    await env.attendance_db.prepare(`
+      UPDATE student_accounts SET password_hash=?,salt=?,must_change_password=1,
+        credential_version=credential_version+1, updated_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `).bind(hashHex,saltHex,studentAccountId).run();
+    return jsonResponse({success:true,message:"Đã đặt lại mật khẩu.",username:existing.username,
+      temporary_password:password,warning:"Mật khẩu chỉ xuất hiện một lần; token cũ đã mất hiệu lực."});
+  } catch(error) {return jsonResponse({success:false,message:"Không thể đặt lại mật khẩu",error:String(error)},500);}
+}
+
+async function handleStudentChangePassword(request:Request,env:Env):Promise<Response> {
+  const actor=await getAuthUser(request,env);
+  if(!actor||actor.role!=="student") return jsonResponse({success:false,message:"Cần đăng nhập tài khoản học sinh."},403);
+  try {
+    const body=await request.json() as {old_password?:string;new_password?:string};
+    if(!body.old_password||!body.new_password||body.new_password.length<12)
+      return jsonResponse({success:false,message:"Cần mật khẩu hiện tại và mật khẩu mới tối thiểu 12 ký tự."},400);
+    if(body.old_password===body.new_password)
+      return jsonResponse({success:false,message:"Mật khẩu mới phải khác mật khẩu cũ."},400);
+    const row=await env.attendance_db.prepare("SELECT password_hash,salt FROM student_accounts WHERE id=?")
+      .bind(actor.id).first<{password_hash:string;salt:string}>();
+    if(!row) return jsonResponse({success:false,message:"Không tìm thấy tài khoản."},404);
+    const oldHash=await hashPassword(body.old_password,row.salt);
+    if(oldHash.hashHex!==row.password_hash) return jsonResponse({success:false,message:"Mật khẩu hiện tại không chính xác."},401);
+    const {hashHex,saltHex}=await hashPassword(body.new_password);
+    await env.attendance_db.prepare(`
+      UPDATE student_accounts SET password_hash=?,salt=?,must_change_password=0,
+        credential_version=credential_version+1,updated_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `).bind(hashHex,saltHex,actor.id).run();
+    return jsonResponse({success:true,message:"Đổi mật khẩu thành công. Vui lòng đăng nhập lại."});
+  } catch(error) {return jsonResponse({success:false,message:"Không thể đổi mật khẩu",error:String(error)},500);}
+}
+
+async function handleStudentMe(request:Request,env:Env):Promise<Response> {
+  const actor=await getAuthUser(request,env);
+  if(!actor||actor.role!=="student") return jsonResponse({success:false,message:"Cần đăng nhập tài khoản học sinh."},403);
+  const row=await env.attendance_db.prepare(`
+    SELECT sa.id AS account_id,sa.username,sa.must_change_password,
+      u.id AS student_id,u.student_code,u.full_name
+    FROM student_accounts sa JOIN users u ON u.id=sa.user_id WHERE sa.id=?
+  `).bind(actor.id).first();
+  return jsonResponse({success:true,data:row});
+}
+
+// =========================================================
+// API ENDPOINTS NGHIỆP VỤ CŨ (GIỮ TƯƠNG THÍCH HOÀN TOÀN)
+// =========================================================
+
+async function healthCheck(env: Env): Promise<Response> {
+  try {
+    const result = await env.attendance_db.prepare("SELECT 1 AS ok").first();
+    return jsonResponse({
+      success: true,
+      message: "Cloudflare Worker + D1 hoạt động",
+      database: result,
+    });
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không kết nối được D1",
+      error: String(error),
+    }, 500);
+  }
+}
+
+async function getStudents(env: Env): Promise<Response> {
+  try {
+    const result = await env.attendance_db
+      .prepare(`
+        SELECT
+          u.id, u.student_code, u.full_name, u.created_at,
+          CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END AS has_face
+        FROM users u
+        LEFT JOIN face_data f ON f.user_id = u.id
+        ORDER BY u.id DESC
+      `)
+      .all();
+
+    return jsonResponse({
+      success: true,
+      data: result.results,
+    });
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể lấy danh sách sinh viên",
+      error: String(error),
+    }, 500);
+  }
+}
+
+async function getFaceData(env: Env): Promise<Response> {
+  try {
+    const result = await env.attendance_db
+      .prepare(`
+        SELECT u.id, u.student_code, u.full_name, f.embedding
+        FROM face_data f
+        INNER JOIN users u ON u.id = f.user_id
+        ORDER BY u.id DESC
+      `)
+      .all();
+
+    return jsonResponse({
+      success: true,
+      data: result.results,
+    });
+  } catch (error) {
+    return jsonResponse({
+      success: false,
+      message: "Không thể lấy dữ liệu khuôn mặt",
+      error: String(error),
+    }, 500);
+  }
+}
+
+async function createStudent(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = (await request.json()) as { student_code?: string; full_name?: string };
+    const studentCode = body.student_code?.trim();
+    const fullName = body.full_name?.trim();
+
+    if (!studentCode || !fullName) {
+      return jsonResponse({ success: false, message: "student_code và full_name là bắt buộc" }, 400);
+    }
+
+    const existing = await env.attendance_db
+      .prepare("SELECT id FROM users WHERE student_code = ?")
+      .bind(studentCode)
+      .first<{ id: number }>();
+
+    if (existing) {
+      return jsonResponse({ success: false, message: "Mã sinh viên đã tồn tại", id: existing.id }, 409);
+    }
+
+    const result = await env.attendance_db
+      .prepare("INSERT INTO users (student_code, full_name) VALUES (?, ?)")
+      .bind(studentCode, fullName)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Thêm sinh viên thành công",
+      id: result.meta.last_row_id,
+      student_code: studentCode,
+      full_name: fullName,
+    }, 201);
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể thêm sinh viên", error: String(error) }, 500);
+  }
+}
+
+async function saveFaceData(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = (await request.json()) as { user_id?: number; embedding?: number[] | string };
+    const userId = Number(body.user_id);
+
+    if (!userId || body.embedding === undefined) {
+      return jsonResponse({ success: false, message: "user_id và embedding là bắt buộc" }, 400);
+    }
+
+    const embeddingText = Array.isArray(body.embedding) ? JSON.stringify(body.embedding) : body.embedding;
+
+    const user = await env.attendance_db.prepare("SELECT id FROM users WHERE id = ?").bind(userId).first();
+    if (!user) {
+      return jsonResponse({ success: false, message: "Không tìm thấy sinh viên" }, 404);
+    }
+
+    await env.attendance_db.prepare("DELETE FROM face_data WHERE user_id = ?").bind(userId).run();
+
+    const result = await env.attendance_db
+      .prepare("INSERT INTO face_data (user_id, embedding) VALUES (?, ?)")
+      .bind(userId, embeddingText)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Lưu dữ liệu khuôn mặt thành công",
+      id: result.meta.last_row_id,
+      user_id: userId,
+    }, 201);
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể lưu dữ liệu khuôn mặt", error: String(error) }, 500);
+  }
+}
+
+async function getClasses(env: Env): Promise<Response> {
+  try {
+    const result = await env.attendance_db
+      .prepare("SELECT id, class_code, class_name, latitude, longitude, radius FROM classes ORDER BY id")
+      .all();
+
+    return jsonResponse({ success: true, data: result.results });
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể lấy danh sách lớp học", error: String(error) }, 500);
+  }
+}
+
+async function createAttendance(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = (await request.json()) as {
+      user_id?: number;
+      class_id?: number;
+      attendance_time?: string;
+      latitude?: number;
+      longitude?: number;
+      distance?: number;
+      face_similarity?: number;
+      status?: string;
+    };
+
+    if (
+      !body.user_id ||
+      !body.class_id ||
+      body.latitude === undefined ||
+      body.longitude === undefined ||
+      body.distance === undefined ||
+      body.face_similarity === undefined ||
+      !body.status
+    ) {
+      return jsonResponse({ success: false, message: "Thiếu dữ liệu điểm danh" }, 400);
+    }
+
+    const attendanceTime = body.attendance_time || new Date().toISOString();
+
+    const result = await env.attendance_db
+      .prepare(`
+        INSERT INTO attendance (user_id, class_id, attendance_time, latitude, longitude, distance, face_similarity, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .bind(body.user_id, body.class_id, attendanceTime, body.latitude, body.longitude, body.distance, body.face_similarity, body.status)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Điểm danh thành công",
+      id: result.meta.last_row_id,
+    }, 201);
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể lưu điểm danh", error: String(error) }, 500);
+  }
+}
+
+async function getAttendance(env: Env): Promise<Response> {
+  try {
+    const result = await env.attendance_db
+      .prepare(`
+        SELECT
+          a.id, a.attendance_time, a.latitude, a.longitude, a.distance, a.face_similarity, a.status,
+          u.student_code, u.full_name,
+          c.class_code, c.class_name
+        FROM attendance a
+        INNER JOIN users u ON u.id = a.user_id
+        INNER JOIN classes c ON c.id = a.class_id
+        ORDER BY a.attendance_time DESC
+      `)
+      .all();
+
+    return jsonResponse({ success: true, data: result.results });
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể lấy lịch sử điểm danh", error: String(error) }, 500);
+  }
+}
+
+async function getStudentByCode(request: Request, env: Env): Promise<Response> {
+  try {
+    const url = new URL(request.url);
+    const code = decodeURIComponent(url.pathname.split("/").pop() || "").trim();
+
+    if (!code) {
+      return jsonResponse({ success: false, message: "Thiếu mã sinh viên" }, 400);
+    }
+
+    const student = await env.attendance_db
+      .prepare(`
+        SELECT u.id, u.student_code, u.full_name, u.created_at,
+          CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END AS has_face
+        FROM users u
+        LEFT JOIN face_data f ON f.user_id = u.id
+        WHERE u.student_code = ?
+        LIMIT 1
+      `)
+      .bind(code)
+      .first();
+
+    if (!student) {
+      return jsonResponse({ success: false, message: "Không tìm thấy sinh viên" }, 404);
+    }
+
+    return jsonResponse({ success: true, data: student, student });
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể tìm sinh viên", error: String(error) }, 500);
+  }
+}
+
+async function updateStudent(request: Request, env: Env, id: number): Promise<Response> {
+  try {
+    const body = (await request.json()) as { student_code?: string; full_name?: string };
+    const studentCode = body.student_code?.trim();
+    const fullName = body.full_name?.trim();
+
+    if (!studentCode || !fullName) {
+      return jsonResponse({ success: false, message: "student_code và full_name là bắt buộc" }, 400);
+    }
+
+    const student = await env.attendance_db.prepare("SELECT id FROM users WHERE id = ?").bind(id).first();
+    if (!student) {
+      return jsonResponse({ success: false, message: "Không tìm thấy sinh viên" }, 404);
+    }
+
+    const duplicate = await env.attendance_db
+      .prepare("SELECT id FROM users WHERE student_code = ? AND id != ? LIMIT 1")
+      .bind(studentCode, id)
+      .first();
+
+    if (duplicate) {
+      return jsonResponse({ success: false, message: "Mã sinh viên đã tồn tại" }, 409);
+    }
+
+    await env.attendance_db
+      .prepare("UPDATE users SET student_code = ?, full_name = ? WHERE id = ?")
+      .bind(studentCode, fullName, id)
+      .run();
+
+    return jsonResponse({ success: true, message: "Cập nhật sinh viên thành công", id, student_code: studentCode, full_name: fullName });
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể cập nhật sinh viên", error: String(error) }, 500);
+  }
+}
+
+async function deleteStudent(env: Env, id: number): Promise<Response> {
+  try {
+    const student = await env.attendance_db.prepare("SELECT id FROM users WHERE id = ?").bind(id).first();
+    if (!student) {
+      return jsonResponse({ success: false, message: "Không tìm thấy sinh viên" }, 404);
+    }
+
+    await env.attendance_db.prepare("DELETE FROM face_data WHERE user_id = ?").bind(id).run();
+    await env.attendance_db.prepare("DELETE FROM attendance WHERE user_id = ?").bind(id).run();
+    await env.attendance_db.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
+
+    return jsonResponse({ success: true, message: "Xóa sinh viên thành công", id });
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể xóa sinh viên", error: String(error) }, 500);
+  }
+}
+
+async function createClass(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = (await request.json()) as {
+      class_code?: string;
+      class_name?: string;
+      latitude?: number;
+      longitude?: number;
+      radius?: number;
+    };
+
+    const classCode = body.class_code?.trim();
+    const className = body.class_name?.trim();
+    const latitude = Number(body.latitude);
+    const longitude = Number(body.longitude);
+    const radius = Number(body.radius);
+
+    if (!classCode || !className || !Number.isFinite(latitude) || !Number.isFinite(longitude) || !Number.isFinite(radius)) {
+      return jsonResponse({ success: false, message: "Thiếu hoặc sai dữ liệu lớp học" }, 400);
+    }
+
+    const existing = await env.attendance_db.prepare("SELECT id FROM classes WHERE class_code = ? LIMIT 1").bind(classCode).first();
+    if (existing) {
+      return jsonResponse({ success: false, message: "Mã lớp đã tồn tại" }, 409);
+    }
+
+    const result = await env.attendance_db
+      .prepare("INSERT INTO classes (class_code, class_name, latitude, longitude, radius) VALUES (?, ?, ?, ?, ?)")
+      .bind(classCode, className, latitude, longitude, radius)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Thêm lớp học thành công",
+      id: result.meta.last_row_id,
+      class_code: classCode,
+      class_name: className,
+      latitude,
+      longitude,
+      radius,
+    }, 201);
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể thêm lớp học", error: String(error) }, 500);
+  }
+}
+
+async function updateClass(request: Request, env: Env, id: number): Promise<Response> {
+  try {
+    const body = (await request.json()) as {
+      class_code?: string;
+      class_name?: string;
+      latitude?: number;
+      longitude?: number;
+      radius?: number;
+    };
+
+    const classCode = body.class_code?.trim();
+    const className = body.class_name?.trim();
+    const latitude = Number(body.latitude);
+    const longitude = Number(body.longitude);
+    const radius = Number(body.radius);
+
+    if (!classCode || !className || !Number.isFinite(latitude) || !Number.isFinite(longitude) || !Number.isFinite(radius)) {
+      return jsonResponse({ success: false, message: "Thiếu hoặc sai dữ liệu lớp học" }, 400);
+    }
+
+    await env.attendance_db
+      .prepare("UPDATE classes SET class_code = ?, class_name = ?, latitude = ?, longitude = ?, radius = ? WHERE id = ?")
+      .bind(classCode, className, latitude, longitude, radius, id)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: "Cập nhật lớp học thành công",
+      id,
+      class_code: classCode,
+      class_name: className,
+      latitude,
+      longitude,
+      radius,
+    });
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể cập nhật lớp học", error: String(error) }, 500);
+  }
+}
+
+async function deleteClass(env: Env, id: number): Promise<Response> {
+  try {
+    await env.attendance_db.prepare("DELETE FROM classes WHERE id = ?").bind(id).run();
+    return jsonResponse({ success: true, message: "Xóa lớp học thành công", id });
+  } catch (error) {
+    return jsonResponse({ success: false, message: "Không thể xóa lớp học", error: String(error) }, 500);
+  }
+}
+
+// =========================================================
+// ROUTER CHÍNH CỦA CLOUDFLARE WORKER
+// =========================================================
+export default {
+  async fetch(request, env): Promise<Response> {
+    if (request.method === "OPTIONS") {
+      return corsResponse();
+    }
+
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    try {
+      // -----------------------------------------------------
+      // AUTH & ADMIN ROUTES (Mới)
+      // -----------------------------------------------------
+      if (path === "/api/admin/bootstrap" && method === "POST") {
+        return await handleAdminBootstrap(request, env);
+      }
+
+      if (path === "/api/auth/register" && method === "POST") {
+        return await handleRegister(request, env);
+      }
+
+      if (path === "/api/auth/login" && method === "POST") {
+        return await handleLogin(request, env);
+      }
+
+      if (path === "/api/admin/registration-requests" && method === "GET") {
+        return await handleGetRegistrationRequests(request, env);
+      }
+
+      const approveMatch = path.match(/^\/api\/admin\/registration-requests\/(\d+)\/approve$/);
+      if (approveMatch && method === "POST") {
+        return await handleApproveRequest(request, env, Number(approveMatch[1]));
+      }
+
+      const rejectMatch = path.match(/^\/api\/admin\/registration-requests\/(\d+)\/reject$/);
+      if (rejectMatch && method === "POST") {
+        return await handleRejectRequest(request, env, Number(rejectMatch[1]));
+      }
+
+      if (path === "/api/admin/accounts" && method === "GET") {
+        return await handleGetAccounts(request, env);
+      }
+
+      if (path === "/api/admin/teacher-classes" && method === "POST") {
+        return await handleAssignTeacherClass(request, env);
+      }
+
+      if (path === "/api/admin/parent-students" && method === "POST") {
+        return await handleAssignParentStudent(request, env);
+      }
+
+      if (path === "/api/role/attendance" && method === "GET") {
+        return await handleRoleAttendance(request, env);
+      }
+
+      if (path === "/api/admin/student-accounts" && method === "GET") {
+        return await handleAdminListStudentAccounts(request,env);
+      }
+      if (path === "/api/admin/student-accounts" && method === "POST") {
+        return await handleAdminCreateStudentAccount(request,env);
+      }
+      const resetStudentMatch = path.match(/^\/api\/admin\/student-accounts\/(\d+)\/reset-password$/);
+      if (resetStudentMatch && method === "POST") {
+        return await handleAdminResetStudentPassword(request,env,Number(resetStudentMatch[1]));
+      }
+      if (path === "/api/student/change-password" && method === "POST") {
+        return await handleStudentChangePassword(request,env);
+      }
+      if (path === "/api/student/me" && method === "GET") {
+        return await handleStudentMe(request,env);
+      }
+
+      // -----------------------------------------------------
+      // ROUTE NGHIỆP VỤ CỦ (Giữ nguyên)
+      // -----------------------------------------------------
+      if (path === "/api/health" && method === "GET") {
+        return await healthCheck(env);
+      }
+
+      if (path === "/api/students" && method === "GET") {
+        return await getStudents(env);
+      }
+
+      if (path === "/api/students" && method === "POST") {
+        return await createStudent(request, env);
+      }
+
+      const studentMatch = path.match(/^\/api\/students\/(\d+)$/);
+      if (studentMatch && method === "PUT") {
+        return await updateStudent(request, env, Number(studentMatch[1]));
+      }
+
+      if (studentMatch && method === "DELETE") {
+        return await deleteStudent(env, Number(studentMatch[1]));
+      }
+
+      const studentCodeMatch = path.match(/^\/api\/students\/code\/(.+)$/);
+      if (studentCodeMatch && method === "GET") {
+        return await getStudentByCode(request, env);
+      }
+
+      if (path === "/api/face-data" && method === "GET") {
+        return await getFaceData(env);
+      }
+
+      if (path === "/api/face-data" && method === "POST") {
+        return await saveFaceData(request, env);
+      }
+
+      if (path === "/api/classes" && method === "GET") {
+        return await getClasses(env);
+      }
+
+      if (path === "/api/classes" && method === "POST") {
+        return await createClass(request, env);
+      }
+
+      const classMatch = path.match(/^\/api\/classes\/(\d+)$/);
+      if (classMatch && method === "PUT") {
+        return await updateClass(request, env, Number(classMatch[1]));
+      }
+
+      if (classMatch && method === "DELETE") {
+        return await deleteClass(env, Number(classMatch[1]));
+      }
+
+      if (path === "/api/attendance" && method === "GET") {
+        return await getAttendance(env);
+      }
+
+      if (path === "/api/attendance" && method === "POST") {
+        return await createAttendance(request, env);
+      }
+
+      return jsonResponse({
+        success: false,
+        message: "API không tồn tại",
+        path,
+        method,
+      }, 404);
+    } catch (error) {
+      return jsonResponse({
+        success: false,
+        message: "Lỗi server",
+        error: String(error),
+      }, 500);
+    }
+  },
+} satisfies ExportedHandler<Env>;

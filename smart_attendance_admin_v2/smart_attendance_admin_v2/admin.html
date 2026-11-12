@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Điểm danh thông minh - Quản trị</title>
+    <link rel="stylesheet" href="admin.css">
+</head>
+<body>
+<div id="authGate" class="auth-gate"><div class="auth-shell">
+ <div class="auth-banner"><h1>✓ Điểm danh thông minh</h1><p>Đăng nhập · Đăng ký Giáo viên/Phụ huynh · Quản trị</p></div>
+ <div class="auth-grid">
+ <form id="loginForm" class="auth-panel"><h2>Đăng nhập</h2><label>Tên đăng nhập hoặc email<input id="loginName" autocomplete="username" required></label><label>Mật khẩu<input id="loginPassword" type="password" autocomplete="current-password" required></label><button class="primary-btn" type="submit">Đăng nhập</button><p class="auth-error" id="loginMsg" role="status"></p></form>
+ <form id="registerForm" class="auth-panel"><h2>Đăng ký tài khoản</h2><label>Tên đăng nhập<input id="regName" autocomplete="username" required></label><label>Email<input id="regEmail" type="email" required></label><label>Mật khẩu (tối thiểu 6 ký tự)<input id="regPassword" type="password" minlength="6" autocomplete="new-password" required></label><label>Vai trò<select id="regRole"><option value="teacher">Giáo viên</option><option value="parent">Phụ huynh</option></select></label><button class="primary-btn" type="submit">Gửi đăng ký</button><p class="auth-error" id="registerMsg" role="status"></p><small>Tài khoản cần Admin phê duyệt trước khi đăng nhập.</small></form>
+ </div><p class="auth-caption">Admin đầu tiên đã được tạo; không cần nhập Bootstrap secret thêm lần nữa.</p>
+ </div></div>
+<div id="passwordGate" hidden><form id="passwordForm" class="auth-panel">
+ <h2>Đổi mật khẩu lần đầu</h2><label>Mật khẩu hiện tại<input id="oldPassword" type="password" autocomplete="current-password" required></label>
+ <label>Mật khẩu mới gồm 6 chữ số<input id="newPassword" type="password" autocomplete="new-password" inputmode="numeric" pattern="[0-9]{6}" required></label>
+ <button type="submit" class="primary-btn">Đổi mật khẩu</button><button type="button" id="cancelPassword">Đăng xuất</button><p id="passwordMsg" role="status"></p>
+ </form></div>
+<div class="app" id="appShell" hidden>
+    <aside class="sidebar" id="sidebar">
+        <div class="brand">
+            <div class="brand-icon">✓</div>
+            <div>
+                <b>Smart Attendance</b>
+                <small>Quản trị hệ thống</small>
+            </div>
+        </div>
+
+        <nav>
+            <button class="nav-item active" data-page="dashboard">⌂ <span>Tổng quan</span></button>
+            <button class="nav-item" data-page="students">♙ <span>Sinh viên</span></button>
+            <button class="nav-item" data-page="classes">▣ <span>Lớp học</span></button>
+            <button class="nav-item admin-only" data-page="roster">👥 <span>Xếp sinh viên vào lớp</span></button>
+            <button class="nav-item admin-only" data-page="schedule">▤ <span>Thời khóa biểu</span></button>
+            <button class="nav-item" data-page="attendance">☷ <span>Lịch sử điểm danh</span></button>
+            <button class="nav-item admin-only" data-page="student-accounts">🎓 <span>Tài khoản học sinh</span></button>
+            <button class="nav-item admin-only" data-page="accounts">♙ <span>Tài khoản</span></button>
+            <button class="nav-item admin-only" data-page="requests">✓ <span>Duyệt đăng ký</span></button>
+            <button class="nav-item admin-only" data-page="assignments">▣ <span>Phân công & liên kết</span></button>
+        </nav>
+
+        <div class="sidebar-bottom">
+            <div class="api-status"><span id="apiDot"></span><span id="apiStatus">Đang kiểm tra API...</span></div>
+            <small>Cloudflare Worker + D1</small>
+        </div>
+    </aside>
+
+    <main class="main">
+        <header class="topbar">
+            <button class="menu-btn" id="menuBtn">☰</button>
+            <div>
+                <h1 id="pageTitle">Tổng quan</h1>
+                <p>Hệ thống điểm danh thông minh</p>
+            </div>
+            <div class="top-actions">
+                <span id="currentUser"></span><button class="refresh-btn" id="logoutBtn">Đăng xuất</button><span id="lastUpdated">--</span>
+                <button class="refresh-btn" id="refreshBtn">↻ Làm mới</button>
+            </div>
+        </header>
+
+        <section class="content">
+            <!-- DASHBOARD -->
+            <div class="page active" id="page-dashboard">
+                <div class="welcome">
+                    <div>
+                        <h2>Xin chào, Quản trị viên 👋</h2>
+                        <p>Theo dõi tình hình điểm danh từ dữ liệu Cloudflare D1.</p>
+                    </div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="stat-icon blue">♙</div><div><span>Sinh viên</span><strong id="statStudents">0</strong></div></div>
+                    <div class="stat-card"><div class="stat-icon purple">▣</div><div><span>Lớp học</span><strong id="statClasses">0</strong></div></div>
+                    <div class="stat-card"><div class="stat-icon green">✓</div><div><span>Lượt điểm danh</span><strong id="statAttendance">0</strong></div></div>
+                    <div class="stat-card"><div class="stat-icon orange">%</div><div><span>Tỉ lệ có mặt</span><strong id="statPresent">0%</strong></div></div>
+                </div>
+
+                <div class="dashboard-grid">
+                    <div class="panel">
+                        <div class="panel-head"><h3>Phân bố trạng thái điểm danh</h3></div>
+                        <div class="status-chart">
+                            <div class="donut" id="donut"></div>
+                            <div class="legend">
+                                <div><i class="present-dot"></i> Có mặt <b id="legendPresent">0</b></div>
+                                <div><i class="late-dot"></i> Muộn <b id="legendLate">0</b></div>
+                                <div><i class="absent-dot"></i> Vắng <b id="legendAbsent">0</b></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="panel">
+                        <div class="panel-head"><h3>Điểm danh gần đây</h3></div>
+                        <div id="recentAttendance" class="recent-list">
+                            <div class="empty">Chưa có dữ liệu.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-head">
+                        <h3>Thông tin hệ thống</h3>
+                        <span class="badge">Cloudflare D1</span>
+                    </div>
+                    <div class="system-info">
+                        <div><span>API</span><b id="apiUrlText"></b></div>
+                        <div><span>Database</span><b>attendance-db</b></div>
+                        <div><span>Bảng</span><b>users · classes · face_data · attendance</b></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- STUDENTS -->
+            <div class="page" id="page-students">
+                <div class="page-tools">
+                    <div>
+                        <h2>Quản lý sinh viên</h2>
+                        <p>Danh sách sinh viên đang lưu trên Cloudflare D1.</p>
+                    </div>
+                    <button class="primary-btn" id="showAddStudent">+ Thêm sinh viên</button>
+                </div>
+
+                <div class="panel add-form" id="addStudentForm" hidden>
+                    <div class="panel-head"><h3 id="studentFormTitle">Thêm sinh viên</h3><button class="icon-btn" id="closeStudentForm">×</button></div>
+                    <div class="form-grid">
+                        <label>Mã sinh viên<input id="studentCode" placeholder="VD: 23CT001"></label>
+                        <label>Họ và tên<input id="studentName" placeholder="VD: Nguyễn Văn A"></label>
+                    </div>
+                    <div class="face-box">
+                        <div class="face-preview" id="facePreview"><span>📷</span><small>Chưa chụp khuôn mặt</small></div>
+                        <div class="face-actions">
+                            <button class="secondary-btn" id="startFaceBtn">Mở camera</button>
+                            <button class="secondary-btn" id="captureFaceBtn" disabled>Chụp khuôn mặt</button>
+                            <button class="secondary-btn" id="stopFaceBtn" disabled>Dừng camera</button>
+                        </div>
+                        <video id="faceVideo" class="face-video" autoplay playsinline hidden></video>
+                        <canvas id="faceCanvas" hidden></canvas>
+                        <div id="faceMessage" class="message"></div>
+                    </div>
+                    <div class="form-actions">
+                        <button class="primary-btn" id="addStudentBtn">Lưu sinh viên</button>
+                        <button class="secondary-btn" id="cancelAddStudent">Hủy</button>
+                    </div>
+                    <div id="studentMessage" class="message"></div>
+                </div>
+
+                <div class="panel">
+                    <div class="table-tools">
+                        <input id="studentSearch" placeholder="🔎 Tìm mã sinh viên hoặc họ tên...">
+                        <span id="studentCount">0 sinh viên</span>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>ID</th><th>Mã SV</th><th>Họ và tên</th><th>Khuôn mặt</th><th>Ngày tạo</th><th>Thao tác</th></tr></thead>
+                            <tbody id="studentsTable"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CLASSES -->
+            <div class="page" id="page-classes">
+                <div class="page-tools">
+                    <div>
+                        <h2>Quản lý lớp học</h2>
+                        <p>Thêm, sửa, xóa lớp và cấu hình vị trí điểm danh.</p>
+                    </div>
+                    <button class="primary-btn" id="showAddClass">+ Thêm lớp</button>
+                </div>
+
+                <div class="panel add-form" id="classForm" hidden>
+                    <div class="panel-head"><h3 id="classFormTitle">Thêm lớp học</h3><button class="icon-btn" id="closeClassForm">×</button></div>
+                    <div class="form-grid class-form-grid">
+                        <label>Mã lớp<input id="classCode" placeholder="VD: CLASS01"></label>
+                        <label>Tên lớp<input id="className" placeholder="VD: Lớp học"></label>
+                        <label>Vĩ độ<input id="classLatitude" type="number" step="0.000001" placeholder="16.032114"></label>
+                        <label>Kinh độ<input id="classLongitude" type="number" step="0.000001" placeholder="108.221900"></label>
+                        <label>Bán kính (m)<input id="classRadius" type="number" step="1" min="1" value="100"></label>
+                    </div>
+                    <div class="form-actions">
+                        <button class="secondary-btn" id="getClassLocation">📍 Lấy vị trí hiện tại</button>
+                        <button class="primary-btn" id="saveClassBtn">Lưu lớp</button>
+                        <button class="secondary-btn" id="cancelClass">Hủy</button>
+                    </div>
+                    <div id="classMessage" class="message"></div>
+                </div>
+
+                <div class="panel">
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th>ID</th><th>Mã lớp</th><th>Tên lớp</th><th>Latitude</th><th>Longitude</th><th>Bán kính</th><th>Thao tác</th></tr></thead>
+                            <tbody id="classesTable"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="location-note">
+                    <b>📍 Vị trí điểm danh:</b> Tọa độ và bán kính được lưu trong bảng <b>classes</b>. Nút “Lấy vị trí hiện tại” dùng GPS của thiết bị đang mở trang quản trị.
+                </div>
+            </div>
+
+            <!-- V4: ROSTER -->
+            <div class="page" id="page-roster">
+                <div class="page-tools"><div><h2>Xếp sinh viên vào lớp</h2><p>Chọn một, nhiều hoặc tất cả sinh viên. Không tạo tài khoản mới.</p></div></div>
+                <div class="panel v4-panel">
+                    <label>Chọn lớp <select id="v4RosterClass"></select></label>
+                    <div class="v4-row"><input id="v4RosterSearch" placeholder="Tìm mã sinh viên hoặc họ tên"><button class="secondary-btn" id="v4RosterAll">Chọn tất cả sinh viên đang lọc</button><button class="secondary-btn" id="v4RosterClear">Bỏ chọn</button></div>
+                    <p id="v4RosterStats"></p><div class="v4-roster-list" id="v4RosterList"></div>
+                    <div class="v4-row"><button class="primary-btn" id="v4AddMembers">+ Thêm sinh viên đã chọn</button><button class="secondary-btn" id="v4RemoveMembers">Gỡ sinh viên đã chọn khỏi lớp</button><button class="secondary-btn" id="v4RefreshRoster">↻ Làm mới</button></div>
+                    <p class="message" id="v4RosterMessage"></p>
+                </div>
+            </div>
+            <!-- V4: SCHEDULE -->
+            <div class="page" id="page-schedule">
+                <div class="page-tools"><div><h2>Thời khóa biểu theo lớp</h2><p>Mỗi dòng là một buổi học; khung điểm danh demo mặc định 3 phút, 1 phút đầu đúng giờ.</p></div></div>
+                <div class="panel v4-panel">
+                    <div class="v4-fields">
+                        <label>Lớp <select id="v4ScheduleClass"></select></label>
+                        <label>Môn học <input id="v4Subject" placeholder="Trí tuệ nhân tạo"></label>
+                        <label>Phòng học <input id="v4Room" placeholder="B302"></label>
+                        <label>Bắt đầu <input id="v4Start" type="datetime-local"></label>
+                        <label>Kết thúc <input id="v4End" type="datetime-local"></label>
+                        <label>Thời gian điểm danh (phút) <input id="v4Duration" type="number" min="1" max="60" value="3"></label>
+                        <label>Thời gian đúng giờ (giây) <input id="v4OnTime" type="number" min="0" max="3599" value="60"></label>
+                    </div>
+                    <div class="v4-row"><button id="v4SaveSchedule" class="primary-btn">+ Tạo buổi học</button><button id="v4CancelEdit" class="secondary-btn" hidden>Hủy sửa</button><button id="v4ReloadSchedule" class="secondary-btn">↻ Tải lịch</button></div>
+                    <p id="v4ScheduleMessage" class="message"></p>
+                </div>
+                <div class="panel"><div class="table-wrap"><table><thead><tr><th>Lớp</th><th>Môn học</th><th>Phòng</th><th>Bắt đầu</th><th>Kết thúc</th><th>Điểm danh</th><th>Thao tác</th></tr></thead><tbody id="v4ScheduleTable"></tbody></table></div></div>
+                <p class="v4-note">Lưu ý: đây là bước quản lý thời khóa biểu. Phiên điểm danh tự đóng, điểm danh Face ID + GPS theo phiên và thông báo đẩy sẽ triển khai sau; không nên coi lịch học là phiên điểm danh đã hoạt động.</p>
+            </div>
+
+            <!-- ATTENDANCE -->
+            <div class="page" id="page-attendance">
+                <div class="page-tools">
+                    <div>
+                        <h2>Lịch sử điểm danh</h2>
+                        <p>Theo dõi toàn bộ lượt điểm danh từ Cloudflare D1.</p>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="table-tools">
+                        <input id="attendanceSearch" placeholder="🔎 Tìm sinh viên, mã SV, lớp...">
+                        <span id="attendanceCount">0 lượt</span>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                            <tr>
+                                <th>Thời gian</th>
+                                <th>Sinh viên</th>
+                                <th>Lớp</th>
+                                <th>Trạng thái</th>
+                                <th>Khoảng cách</th>
+                                <th>Độ giống</th>
+                                <th>GPS</th>
+                            </tr>
+                            </thead>
+                            <tbody id="attendanceTable"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+
+            <div class="page" id="page-student-accounts">
+              <div class="page-tools"><div><h2>Quản lý tài khoản học sinh</h2><p>Nhập danh sách từ Excel, quản lý tài khoản học sinh và xóa tài khoản khi cần.</p></div><button class="secondary-btn" id="reloadStudentAccounts">↻ Làm mới</button></div>
+              <p class="notice" id="studentAccountsMessage" role="status"></p>
+              <div class="panel bulk-panel">
+                <div class="panel-head"><h3>Nhập Excel và cấp tài khoản hàng loạt</h3><span class="badge">Dành cho Admin</span></div>
+                <p class="account-hint">Excel gồm 4 cột bắt buộc: <b>student_code</b>, <b>full_name</b>, <b>parent_username</b>, <b>parent_email</b>. Admin cấp tài khoản sinh viên và phụ huynh, liên kết phụ huynh với từng sinh viên mà không cần duyệt đăng ký.</p>
+                <div class="bulk-actions">
+                  <label class="bulk-file-label" for="bulkStudentFile">Chọn file Excel / CSV</label>
+                  <input id="bulkStudentFile" type="file" accept=".xlsx,.xls,.csv" />
+                  <button type="button" class="primary-btn" id="bulkStudentCreateBtn" disabled>Tạo tài khoản sinh viên + phụ huynh</button>
+                  <button type="button" class="secondary-btn" id="bulkStudentExportBtn" disabled>⬇ Xuất danh sách mật khẩu Excel</button>
+                </div>
+                <p class="notice" id="bulkStudentMessage" role="status">Chưa chọn tệp danh sách.</p>
+                <div class="table-wrap" id="bulkStudentPreview" hidden><table><thead><tr><th>STT</th><th>Mã sinh viên</th><th>Họ và tên</th><th>Tài khoản phụ huynh</th><th>Email phụ huynh</th><th>Kiểm tra</th></tr></thead><tbody id="bulkStudentPreviewTable"></tbody></table></div>
+                <p class="account-hint"><strong>Lưu ý:</strong> Tài khoản đã có sẽ được bỏ qua, không đổi mật khẩu. File kết quả chỉ chứa mật khẩu mới cấp trong lần nhập này. Lưu file ở nơi riêng tư và gửi mật khẩu cho từng sinh viên, không phát công khai cả danh sách. Phụ huynh đã tồn tại với đúng username/email sẽ được liên kết thêm con và không đổi mật khẩu.</p>
+              </div>
+              <div class="panel"><div class="panel-head"><h3>Danh sách tài khoản đã cấp</h3><span class="badge" id="studentAccountsCount">0 tài khoản</span></div>
+                <div class="account-delete-tools">
+                  <span id="selectedStudentAccountsCount">Đã chọn 0 tài khoản</span>
+                  <button class="small-btn danger" type="button" id="deleteSelectedStudentAccounts" disabled>Xóa tài khoản đã chọn</button>
+                  <button class="small-btn danger" type="button" id="deleteAllStudentAccounts" disabled>Xóa tất cả tài khoản</button>
+                </div>
+                <p class="account-hint">Chỉ xóa tài khoản đăng nhập học sinh. Không xóa hồ sơ sinh viên, dữ liệu khuôn mặt hoặc lịch sử điểm danh. Xóa tài khoản sẽ khiến học sinh không thể đăng nhập bằng tài khoản đó.</p>
+                <div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="selectAllStudentAccounts" aria-label="Chọn tất cả tài khoản hiển thị" title="Chọn tất cả" /></th><th>Mã sinh viên / Username</th><th>Họ và tên</th><th>Trạng thái</th><th>Đổi mật khẩu lần đầu</th><th>Ngày tạo</th><th>Thao tác</th></tr></thead><tbody id="studentAccountsTable"></tbody></table></div>
+              </div>
+            </div>
+            <div id="studentCredentialModal" class="credential-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="studentCredentialTitle">
+              <div class="credential-dialog"><h3 id="studentCredentialTitle">Thông tin đăng nhập tạm thời</h3><p>Hãy sao chép và cấp riêng cho đúng học sinh. <strong>Mật khẩu không thể xem lại sau khi đóng.</strong></p>
+              <label>Tên đăng nhập<input id="issuedStudentUsername" readonly autocomplete="off"></label>
+              <label>Mật khẩu tạm<input id="issuedStudentPassword" readonly autocomplete="off"></label>
+              <div class="form-actions"><button class="primary-btn" id="copyStudentCredentialBtn">Sao chép thông tin</button><button class="secondary-btn" id="closeStudentCredentialBtn">Đã lưu, đóng</button></div>
+              <p class="notice">Lưu ý: Học sinh phải đổi mật khẩu trước khi xem lịch sử cá nhân.</p></div>
+            </div>
+            <div class="page" id="page-accounts"><div class="page-tools"><div><h2>Danh sách tài khoản</h2><p>Tài khoản hệ thống và trạng thái duyệt.</p></div></div><div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Vai trò</th><th>Trạng thái</th><th>Ngày tạo</th></tr></thead><tbody id="accountsTable"></tbody></table></div><p id="accountsMessage" class="notice"></p></div></div>
+            <div class="page" id="page-requests"><div class="page-tools"><div><h2>Yêu cầu đăng ký chờ duyệt</h2><p>Kiểm tra trước khi cấp quyền sử dụng hệ thống.</p></div><button class="primary-btn" id="reloadRequests">↻ Làm mới</button></div><div class="panel"><div class="table-wrap"><table><thead><tr><th>Tài khoản</th><th>Email</th><th>Vai trò</th><th>Ngày đăng ký</th><th>Thao tác</th></tr></thead><tbody id="requestsTable"></tbody></table></div><p id="requestsMessage" class="notice"></p></div></div>
+            <div class="page" id="page-assignments"><div class="page-tools"><div><h2>Phân công giáo viên & liên kết phụ huynh</h2><p>Giới hạn lịch sử điểm danh theo lớp hoặc học sinh liên kết.</p></div></div><div class="assignment-grid"><div class="panel"><h3>Giáo viên → Lớp</h3><label>Giáo viên<select id="teacherSelect"></select></label><label>Lớp phụ trách<select id="assignedClassSelect"></select></label><button class="primary-btn" id="assignTeacherBtn">Phân công</button><p class="notice" id="teacherAssignMsg"></p></div><div class="panel"><h3>Phụ huynh → Học sinh</h3><label>Phụ huynh<select id="parentSelect"></select></label><label>Học sinh<select id="assignedStudentSelect"></select></label><button class="primary-btn" id="assignParentBtn">Liên kết</button><p class="notice" id="parentAssignMsg"></p></div></div></div>
+        </section>
+    </main>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="admin.js"></script>
+</body>
+</html>

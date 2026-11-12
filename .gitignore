@@ -1,0 +1,27 @@
+# =========================================================
+# GITIGNORE CHO TOÀN BỘ DỰ ÁN SMART ATTENDANCE
+# =========================================================
+
+# Archive Zips
+*.zip
+*.tar.gz
+
+# Node / Cloudflare Worker
+**/node_modules/
+**/.wrangler/
+
+# Flutter / Dart
+**/build/
+**/.dart_tool/
+**/.pub/
+**/.pub-cache/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+
+# IDE & OS
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db

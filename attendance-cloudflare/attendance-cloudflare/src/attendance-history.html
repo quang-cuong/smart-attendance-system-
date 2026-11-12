@@ -1,0 +1,166 @@
+
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lịch sử điểm danh</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          font-family: Arial, sans-serif;
+          background: #f3f6fb;
+          color: #243247;
+        }
+        header {
+          background: #17365d;
+          color: white;
+          padding: 22px 28px;
+        }
+        main { padding: 24px; max-width: 1200px; margin: auto; }
+        .filters, .panel {
+          background: white;
+          padding: 18px;
+          border-radius: 10px;
+          margin-bottom: 18px;
+          box-shadow: 0 2px 8px #0000000a;
+        }
+        .filters {
+          display: flex;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+        input, select, button {
+          padding: 10px;
+          border: 1px solid #ccd5e0;
+          border-radius: 6px;
+        }
+        input { flex: 1; min-width: 180px; }
+        button { background: #1769aa; color: white; cursor: pointer; }
+        .table-wrap { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; background: white; }
+        th, td {
+          padding: 12px;
+          text-align: left;
+          border-bottom: 1px solid #e7edf4;
+          white-space: nowrap;
+        }
+        th { background: #edf3fa; }
+        #message { color: #b42318; }
+        @media (max-width: 600px) {
+          main { padding: 12px; }
+          header { padding: 18px; }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <h2>Smart Attendance</h2>
+    <div>Lịch sử điểm danh</div>
+</header>
+
+<main>
+    <section class="filters">
+        <input id="keyword" placeholder="Tìm mã hoặc tên sinh viên">
+        <input id="date" type="date">
+        <button onclick="loadHistory()">Tìm kiếm</button>
+        <button onclick="resetFilters()">Làm mới</button>
+    </section>
+
+    <section class="panel">
+        <h3>Danh sách điểm danh</h3>
+        <p id="message">Đang tải dữ liệu...</p>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                <tr>
+                    <th>Mã sinh viên</th>
+                    <th>Họ tên</th>
+                    <th>Lớp</th>
+                    <th>Thời gian</th>
+                    <th>Khoảng cách (m)</th>
+                    <th>Trạng thái</th>
+                </tr>
+                </thead>
+                <tbody id="history"></tbody>
+            </table>
+        </div>
+    </section>
+</main>
+
+<script>
+    const API =
+      'https://attendance-cloudflare.quangcuongdk1.workers.dev/api/attendance';
+
+    let allRecords = [];
+
+    // Tải lịch sử từ API.
+    async function loadHistory() {
+      const message = document.getElementById('message');
+      message.textContent = 'Đang tải dữ liệu...';
+
+      try {
+        const response = await fetch(API);
+        const result = await response.json();
+
+        if (!response.ok || result.success !== true) {
+          throw new Error(result.message || 'Không tải được lịch sử');
+        }
+
+        allRecords = Array.isArray(result.data) ? result.data : [];
+        renderHistory();
+      } catch (error) {
+        message.textContent = 'Lỗi tải dữ liệu: ' + error.message;
+      }
+    }
+
+    // Lọc và hiển thị lịch sử điểm danh.
+    function renderHistory() {
+      const keyword = document.getElementById('keyword')
+        .value.trim().toLowerCase();
+      const date = document.getElementById('date').value;
+
+      const rows = allRecords.filter(item => {
+        const text = `${item.student_code || ''} ${item.full_name || ''}`
+          .toLowerCase();
+        const time = String(item.attendance_time || '');
+        const sameDate = !date || time.startsWith(date);
+
+        return text.includes(keyword) && sameDate;
+      });
+
+      document.getElementById('history').innerHTML = rows.map(item => `
+        <tr>
+          <td>${escapeHtml(item.student_code)}</td>
+          <td>${escapeHtml(item.full_name)}</td>
+          <td>${escapeHtml(item.class_name || item.class_code)}</td>
+          <td>${escapeHtml(item.attendance_time)}</td>
+          <td>${escapeHtml(item.distance)}</td>
+          <td>${escapeHtml(item.status)}</td>
+        </tr>
+      `).join('');
+
+      document.getElementById('message').textContent =
+        `Tìm thấy ${rows.length} lượt điểm danh`;
+    }
+
+    // Ngăn dữ liệu từ API được hiểu như mã HTML.
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;',
+        '"': '&quot;', "'": '&#39;'
+      })[char]);
+    }
+
+    // Xóa bộ lọc và hiển thị lại toàn bộ dữ liệu đã tải.
+    function resetFilters() {
+      document.getElementById('keyword').value = '';
+      document.getElementById('date').value = '';
+      renderHistory();
+    }
+
+    loadHistory();
+</script>
+</body>
+</html>
